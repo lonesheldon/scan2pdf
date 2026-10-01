@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+# scan2pdf v3 :: lonecrafts - unique is the motto
+# usage: scan2pdf [--bind [KEY]] [--help]
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "scan2pdf needs bash 4 or newer."; exit 1
+fi
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")
+
+case "${1:-}" in
+  -h|--help) echo "scan2pdf                scan pages into one PDF"; echo "scan2pdf --bind [KEY]   GNOME shortcut (default <Control><Alt>s)"; exit 0 ;;
+esac
+
+# started from a shortcut with no terminal? open one and rerun inside it
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  for t in ptyxis gnome-terminal kgx konsole xfce4-terminal mate-terminal lxterminal tilix alacritty kitty foot wezterm xterm x-terminal-emulator; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    case "$t" in
+      ptyxis) exec ptyxis -x "$SELF" ;;
+      gnome-terminal) exec gnome-terminal -- "$SELF" ;;
+      konsole|kgx|alacritty|xterm|lxterminal|tilix|x-terminal-emulator) exec "$t" -e "$SELF" ;;
+      xfce4-terminal|mate-terminal) exec "$t" -x "$SELF" ;;
+      kitty|foot) exec "$t" "$SELF" ;;
+      wezterm) exec wezterm start -- "$SELF" ;;
+    esac
+  done
+  exit 1
+fi
+
+install_hint() {
+  if command -v apt >/dev/null 2>&1; then echo "sudo apt install sane-utils sane-airscan simple-scan"
+  elif command -v dnf >/dev/null 2>&1; then echo "sudo dnf install sane-backends sane-airscan"
+  elif command -v pacman >/dev/null 2>&1; then echo "sudo pacman -S sane sane-airscan"
+  elif command -v zypper >/dev/null 2>&1; then echo "sudo zypper install sane-backends sane-airscan"
+  else echo "install SANE (sane-backends) and sane-airscan"; fi
+}
+
+bind_key() {
+  local key="${1:-<Control><Alt>s}" K P CUR NEW S
+  if ! command -v gsettings >/dev/null 2>&1 || ! gsettings list-schemas 2>/dev/null | grep -q '^org.gnome.settings-daemon.plugins.media-keys$'; then
+    echo "Not GNOME. Add a shortcut in your desktop's keyboard settings that runs:"; echo "  $SELF"; return 1
+  fi
+  K=org.gnome.settings-daemon.plugins.media-keys
+  P=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/scan2pdf/
+  CUR=$(gsettings get $K custom-keybindings)
+  case "$CUR" in
+    *scan2pdf*) ;;
+    *) if [ "$CUR" = "@as []" ] || [ "$CUR" = "[]" ]; then NEW="['$P']"; else NEW="${CUR%]}, '$P']"; fi
+       gsettings set $K custom-keybindings "$NEW" ;;
+  esac
+  S=$K.custom-keybinding:$P
+  gsettings set $S name 'Scan to PDF'
+  gsettings set $S command "$SELF"
+  gsettings set $S binding "$key"
+  echo "Bound $key -> $SELF"
+}
+if [ "${1:-}" = "--bind" ]; then bind_key "${2:-}"; exit $?; fi
+
+if ! command -v scanimage >/dev/null 2>&1; then
+  echo "scanimage not found. Install SANE:"; echo "  $(install_hint)"
+  read -rp "Enter to close" _; exit 1
+fi
+
+# ---------- charset / terminal size ----------
+if [ "$(locale charmap 2>/dev/null)" != "UTF-8" ] && locale -a 2>/dev/null | grep -qix 'c.utf-\?8'; then
+  export LC_ALL=C.UTF-8
+fi
+if [ "$(locale charmap 2>/dev/null)" = "UTF-8" ]; then
+  BLK='█'; HL='─'; TL='┌'; TR='┐'; BL='└'; BR='┘'; VL='│'; DOT='·'; OK='✔'; NO='✘'; SHADE='▓'; LT='░'; PGL='▤'; ARW='▸'
+else
+  BLK='#'; HL='-'; TL='+'; TR='+'; BL='+'; BR='+'; VL='|'; DOT='.'; OK='[ok]'; NO='[x]'; SHADE='#'; LT='.'; PGL='='; ARW='>'
+fi
+COLS=$(tput cols 2>/dev/null); LN=$(tput lines 2>/dev/null)
+[[ $COLS =~ ^[0-9]+$ ]] || COLS=80
+[[ $LN =~ ^[0-9]+$ ]] || LN=24
+COMPACT=0; [ "$COLS" -lt 52 ] && COMPACT=1
+SIMPLE=0; { [ "$COLS" -lt 36 ] || [ "$LN" -lt 14 ]; } && SIMPLE=1
+
+C0=$'\e[0m'; CG=$'\e[32m'; CC=$'\e[36m'; CY=$'\e[33m'; CM=$'\e[35m'; CR=$'\e[31m'; CD=$'\e[2m'; CB=$'\e[1m'
+if [ -n "${NO_COLOR:-}" ]; then C0=; CG=; CC=; CY=; CM=; CR=; CD=; CB=; fi
+
+# ---------- config (parsed, never sourced) ----------
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/scan2pdf.conf"
+FMT=pdf; RES=150; PREFDEV=""; SASS=1; PIN=0
+DOCS=$(xdg-user-dir DOCUMENTS 2>/dev/null); [ -d "$DOCS" ] || DOCS="$HOME/Documents"
+OUT="$DOCS/Scans"; DEF_OUT=$OUT
+load_conf() {
+  [ -f "$CONF" ] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      FMT) case "$v" in pdf|png|jpg) FMT=$v ;; esac ;;
+      RES) [[ $v =~ ^[0-9]{2,4}$ ]] && RES=$v ;;
+      DEV) PREFDEV=$v ;;
+      OUT) [ -n "$v" ] && OUT=$v ;;
+      SASS) case "$v" in 0|1) SASS=$v ;; esac ;;
+      PIN) case "$v" in 0|1) PIN=$v ;; esac ;;
+    esac
+  done < "$CONF"
+}
+save_conf() {
+  mkdir -p "$(dirname "$CONF")" 2>/dev/null
+  printf 'FMT=%s\nRES=%s\nDEV=%s\nOUT=%s\nSASS=%s\nPIN=%s\n' "$FMT" "$RES" "$PREFDEV" "$OUT" "$SASS" "$PIN" > "$CONF" 2>/dev/null
+}
+load_conf
+
+TMP=$(mktemp -d 2>/dev/null) || { echo "cannot create temp dir"; exit 1; }
+TMO=""; TMO30=""
+command -v timeout >/dev/null 2>&1 && { TMO="timeout 180"; TMO30="timeout 40"; }
+DEVS=(); DESC=(); DPID=""; DEV=""; LASTERR=""; BANNER_SEEN=""; LAST_SAVED=""; AUTO=0; AUTOUSED=0
+
+cleanup() {
+  trap - EXIT
+  stty echo 2>/dev/null; tput cnorm 2>/dev/null
+  kill $(jobs -p) 2>/dev/null; pkill -P $$ 2>/dev/null
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+trap 'echo; exit 130' INT TERM HUP
+tput civis 2>/dev/null
+
+# ---------- helpers ----------
+rep() { local o="" j; for ((j=0;j<$2;j++)); do o+="$1"; done; printf '%s' "$o"; }
+drain() { local _; while read -r -t 0.01 -n 1000 _ 2>/dev/null; do :; done; }
+typewrite() { local t="$1" i; for ((i=0;i<${#t};i++)); do printf '%s' "${t:i:1}"; sleep 0.012; done; printf '\n'; }
+last_err() { grep -v '^[[:space:]]*$' "$TMP/err" 2>/dev/null | tail -1 | cut -c1-70; }
+sassy() { [ "$SASS" = 1 ] && [ -z "${SCAN_NOSASS:-}" ]; }
+say_m() { printf '  %s' "$CM"; typewrite "$1"; printf '%s' "$C0"; }
+ask_yn() {
+  local a
+  while true; do
+    drain
+    printf '  %s%s Y/N:%s ' "$CY" "$1" "$C0"
+    read -rn1 a || exit 0; echo
+    case "$a" in y|Y) return 0 ;; n|N) return 1 ;; *) echo "  Y or N." ;; esac
+  done
+}
+uniq_path() { local p="$1" ext="$2" i=1 c; c="$p$ext"; while [ -e "$c" ]; do c="${p}_$i$ext"; i=$((i+1)); done; printf '%s' "$c"; }
+
+BEAM=$(rep "$BLK" 30); BLANK=$(rep ' ' 30); HR=$(rep "$HL" 30)
+TXT=(
+"  ============  =====  =====  "
+"  =====  ========  =======    "
+"  ==========  ====  ========  "
+"  ====  ===========  =====    "
+"  ========  ======  ========  "
+"  =======  =========  ======  "
+"  ==========  =====  =====    "
+"  ====  ======  ===========   "
+)
+TXTR=(); for i in "${!TXT[@]}"; do TXTR[i]=$(printf '%-30.30s' "${TXT[i]}"); done
+
+# ---------- logo ----------
+build_art() {
+  local L_S=("XXXXX" "X    " "XXXXX" "    X" "XXXXX")
+  local L_C=("XXXXX" "X    " "X    " "X    " "XXXXX")
+  local L_A=("XXXXX" "X   X" "XXXXX" "X   X" "X   X")
+  local L_N=("X   X" "XX  X" "X X X" "X  XX" "X   X")
+  local L_P=("XXXX " "X   X" "XXXX " "X    " "X    ")
+  local L_D=("XXXX " "X   X" "X   X" "X   X" "XXXX ")
+  local L_F=("XXXXX" "X    " "XXXX " "X    " "X    ")
+  local r mid
+  ART=()
+  for r in 0 1 2 3 4; do
+    mid="        "; [ $r -eq 2 ] && mid="  >>>>  "
+    ART[r]="  ${L_S[r]} ${L_C[r]} ${L_A[r]} ${L_N[r]}${mid}${L_P[r]} ${L_D[r]} ${L_F[r]}"
+    ART[r]=${ART[r]//X/$BLK}
+  done
+}
+build_art
+
+banner() {
+  local W=50 x row f i out anim=0 t="lonecrafts :: unique is the motto"
+  local cols=(31 33 32 36 34 35)
+  clear
+  printf '\n'
+  if [ "$COMPACT" -eq 1 ]; then
+    printf '  %s%sSCAN >>>> PDF%s\n  %s%s%s\n\n' "$CB" "$CC" "$C0" "$CD" "$t" "$C0"; BANNER_SEEN=1; return
+  fi
+  if [ -z "$BANNER_SEEN" ]; then
+    anim=1
+    printf '\n\n\n\n\n\e[5A'
+    for ((x=0;x<=W;x++)); do
+      for row in 0 1 2 3 4; do printf '%s%s%s%s%s\e[K\n' "$CC" "${ART[row]:0:x}" "$CG" "$SHADE" "$C0"; done
+      printf '\e[5A'; sleep 0.015
+    done
+  fi
+  BANNER_SEEN=1
+  for row in 0 1 2 3 4; do printf '%s%s%s\e[K\n' "$CC" "${ART[row]}" "$C0"; done
+  printf '\n'
+  if [ $anim -eq 1 ]; then
+    for ((f=0; f<${#t}+10; f++)); do
+      out=""
+      for ((i=0; i<${#t} && i<=f; i++)); do out+=$'\e[1;'"${cols[(i+f)%6]}"'m'"${t:i:1}"; done
+      printf '\r    %s\e[0m\e[K' "$out"; sleep 0.025
+    done
+  fi
+  printf '\r    %s%slonecrafts%s %s:: unique is the motto%s\e[K\n\n' "$CB" "$CM" "$C0" "$CD" "$C0"
+}
+
+# ---------- device discovery (background) ----------
+detect_start() {
+  rm -f "$TMP/devs"
+  ( $TMO30 scanimage -L 2>/dev/null | sed -n "s/^device \`\([^']*\)' is a \(.*\)$/\1|\2/p" | grep -v -e '^v4l:' -e '^test:' > "$TMP/devs.tmp"; mv "$TMP/devs.tmp" "$TMP/devs" ) &
+  DPID=$!
+}
+load_devs() {
+  DEVS=(); DESC=()
+  local id rest line i pd pdesc
+  local -a hi=() mid=() lo=()
+  [ -f "$TMP/devs" ] || return 0
+  while IFS='|' read -r id rest; do
+    [ -n "$id" ] || continue
+    case "$id" in
+      airscan:*) mid+=("$id|$rest") ;;
+      escl:*) lo+=("$id|$rest") ;;
+      *) hi+=("$id|$rest") ;;
+    esac
+  done < "$TMP/devs"
+  for line in "${hi[@]}" "${mid[@]}" "${lo[@]}"; do DEVS+=("${line%%|*}"); DESC+=("${line#*|}"); done
+  if [ -n "$PREFDEV" ]; then
+    for i in "${!DEVS[@]}"; do
+      if [ "${DEVS[i]}" = "$PREFDEV" ] && [ "$i" -ne 0 ]; then
+        pd=${DEVS[i]}; pdesc=${DESC[i]}
+        unset 'DEVS[i]' 'DESC[i]'
+        DEVS=("$pd" "${DEVS[@]}"); DESC=("$pdesc" "${DESC[@]}"); break
+      fi
+    done
+  fi
+}
+detect_wait() {
+  [ -n "$DPID" ] || return 0
+  local k=0 sp='|/-\'
+  while kill -0 "$DPID" 2>/dev/null; do
+    printf '\r  %s%s%s looking for scanners ...\e[K' "$CY" "${sp:k%4:1}" "$C0"; k=$((k+1)); sleep 0.1
+  done
+  printf '\r\e[K'
+  wait "$DPID" 2>/dev/null; DPID=""
+  load_devs
+}
+no_scanner_help() {
+  printf '\n  %s%s no scanners found.%s\n' "$CR" "$NO" "$C0"
+  cat <<H
+  - same Wi-Fi/network as the scanner? guest networks and VLANs hide it
+  - USB: replug it, try another port, make sure it is switched on
+  - drivers: $(install_hint)
+    (HP needs hplip, Epson needs epsonscan2 or iscan)
+  - permissions: check 'id -nG' for scanner or lp
+H
+  echo
+}
+ensure_devs() {
+  while true; do
+    detect_wait
+    [ ${#DEVS[@]} -gt 0 ] && return 0
+    no_scanner_help
+    ask_yn "Search again?" || return 1
+    detect_start
+  done
+}
+pick_device() {
+  detect_wait
+  local i v max=${#DEVS[@]}
+  for i in "${!DEVS[@]}"; do printf '  %d) %s\n     %s%s%s\n' $((i+1)) "${DESC[i]}" "$CD" "${DEVS[i]}" "$C0"; done
+  [ "$max" -eq 0 ] && echo "  no scanners found right now."
+  printf '  0 = auto (recommended)'
+  [ "$max" -gt 0 ] && printf ', 1-%d = pin that scanner' "$max"
+  printf ', Enter = keep: '
+  read -rn1 v || return; echo
+  if [ "$v" = 0 ]; then
+    PREFDEV=""; PIN=0; load_devs; echo "  scanner: auto"
+  elif [[ $v =~ ^[1-9]$ ]] && [ "$v" -le "$max" ]; then
+    PREFDEV=${DEVS[v-1]}; PIN=1; load_devs; echo "  scanner pinned."
+  fi
+}
+
+# ---------- settings + lobby ----------
+settings_menu() {
+  local a v dv
+  while true; do
+    if [ "$PIN" = 1 ]; then
+      if [ "${DEVS[0]:-}" = "$PREFDEV" ]; then dv="${DESC[0]} [pinned]"; else dv="pinned (not found right now)"; fi
+    elif [ -n "${DESC[0]:-}" ]; then dv="auto [${DESC[0]}]"
+    else dv="auto"; fi
+    echo
+    printf '  %s-- settings --%s\n' "$CB" "$C0"
+    printf '  1) format      : %s\n  2) resolution  : %s dpi\n  3) scanner     : %s\n  4) save folder : %s\n  5) sass        : %s\n  6) reset all to defaults\n  Enter) back  > ' "${FMT^^}" "$RES" "$dv" "$OUT" "$([ "$SASS" = 1 ] && echo ON || echo OFF)"
+    read -rn1 a || return; echo
+    case "$a" in
+      1) printf '  format  1) PDF  2) PNG  3) JPG  0) default (PDF) : '; read -rn1 v || return; echo
+         case "$v" in 0|1) FMT=pdf ;; 2) FMT=png ;; 3) FMT=jpg ;; esac ;;
+      2) printf '  dpi  1) 100  2) 150  3) 200  4) 300  5) 600  0) default (150) : '; read -rn1 v || return; echo
+         case "$v" in 0|2) RES=150 ;; 1) RES=100 ;; 3) RES=200 ;; 4) RES=300 ;; 5) RES=600 ;; esac ;;
+      3) pick_device ;;
+      4) tput cnorm 2>/dev/null; printf '  folder (Enter = keep, 0 = default): '; read -re v || return; tput civis 2>/dev/null
+         [ "$v" = 0 ] && v=$DEF_OUT
+         if [ -n "$v" ]; then
+           v=${v/#\~/$HOME}
+           if mkdir -p "$v" 2>/dev/null && [ -w "$v" ]; then OUT=$v; else echo "  cannot write there."; fi
+         fi ;;
+      5) if [ "$SASS" = 1 ]; then SASS=0; else SASS=1; fi ;;
+      6) if ask_yn "Reset every setting to default?"; then
+           FMT=pdf; RES=150; PREFDEV=""; PIN=0; SASS=1; OUT=$DEF_OUT
+           mkdir -p "$OUT" 2>/dev/null; load_devs; echo "  all settings reset."
+         fi ;;
+      *) break ;;
+    esac
+    save_conf
+  done
+}
+
+lobby() {
+  local greets=("yo, what's up?" "hey boss, what's good?" "scanner's warmed up. how's your day?" "sup. talk to me while the glass heats up.")
+  local fallback=("hm, interesting. go on." "noted. I'm a scanner, not a therapist, but noted." "fair enough." "say more, I've got all day. well, 150 dpi of it." "bold take.")
+  local jokes=("why did the scanner get promoted? it was outstanding in its field." "I'd tell you a paper joke but it's a bit flat." "I used to be a printer, but I felt like I was just copying everyone.")
+  local say l r
+  drain; tput cnorm 2>/dev/null
+  printf '  %s%s%s\n  %s(Enter = start scanning, s = settings, q = bail)%s\n\n' "$CY" "${greets[RANDOM % ${#greets[@]}]}" "$C0" "$CD" "$C0"
+  while true; do
+    printf '  %s>%s ' "$CG" "$C0"
+    read -r say || exit 0
+    l=${say,,}
+    case "$l" in
+      "") break ;;
+      q|quit|exit|bye) exit 0 ;;
+      s|set|settings) settings_menu; r="locked in: ${FMT^^} @ ${RES} dpi. hit Enter to scan." ;;
+      *joke*) r=${jokes[RANDOM % ${#jokes[@]}]} ;;
+      hi|hey|yo|sup|hello*|"what's up"*|whats\ up*) r="not much, just vibing next to a lamp that scans things. you?" ;;
+      *"how are you"*|*hbu*|*"how r u"*) r="running at a steady ${RES} dpi. can't complain." ;;
+      *tired*|*boring*|*bored*) r="same. let's knock these pages out and get you out of here." ;;
+      *work*) r="work, yeah. paper never stops. hit Enter when you're ready." ;;
+      *coffee*|*tea*) r="coffee away from the glass please. spills kill scanners." ;;
+      *thank*|*thx*) r="anytime." ;;
+      *) r=${fallback[RANDOM % ${#fallback[@]}]} ;;
+    esac
+    printf '  %s' "$CM"; typewrite "$r"; printf '%s' "$C0"
+  done
+  tput civis 2>/dev/null
+  banner
+}
+
+# ---------- scanning ----------
+do_scan() {
+  : > "$TMP/err"
+  local try
+  for try in 1 2; do
+    $TMO scanimage -d "$1" --format="$SFMT" --resolution "$RES" > "$2" 2>>"$TMP/err" && [ -s "$2" ] && return 0
+    grep -qiE 'resolution|range' "$TMP/err" && break
+    [ $try -eq 1 ] && sleep 2
+  done
+  if grep -qiE 'resolution|range' "$TMP/err"; then
+    $TMO scanimage -d "$1" --format="$SFMT" > "$2" 2>>"$TMP/err" && [ -s "$2" ] && return 0
+  fi
+  mkdir -p "$HOME/.cache" 2>/dev/null
+  { echo "--- $(date +%T) dev=$1 res=$RES fmt=$SFMT"; cat "$TMP/err"; } >> "$HOME/.cache/scan2pdf.log" 2>/dev/null
+  return 1
+}
+
+scan_anim() {
+  local pid=$1 pg=$2 rows=8 r=0 i k=0 drawn=0 H=11 sp='|/-\'
+  stty -echo 2>/dev/null
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$SIMPLE" -eq 1 ]; then
+      printf '\r  %s%s%s scanning page %s ...\e[K' "$CY" "${sp:k%4:1}" "$C0" "$pg"; k=$((k+1)); sleep 0.1; continue
+    fi
+    [ $drawn -eq 1 ] && printf '\e[%dA' "$H"
+    drawn=1
+    printf '  %s%s%s%s%s\e[K\n' "$CC" "$TL" "$HR" "$TR" "$C0"
+    for ((i=0;i<rows;i++)); do
+      if   [ $i -eq $r ]; then printf '  %s%s%s%s%s%s%s\e[K\n' "$CC" "$VL" "$CG" "$BEAM" "$CC" "$VL" "$C0"
+      elif [ $i -lt $r ]; then printf '  %s%s%s%s%s%s%s\e[K\n' "$CC" "$VL" "$C0" "${TXTR[i]}" "$CC" "$VL" "$C0"
+      else printf '  %s%s%s%s%s%s%s\e[K\n' "$CC" "$VL" "$C0" "$BLANK" "$CC" "$VL" "$C0"; fi
+    done
+    printf '  %s%s%s%s%s\e[K\n' "$CC" "$BL" "$HR" "$BR" "$C0"
+    printf '  %s%s%s scanning page %s%s%s ... hold still\e[K\n' "$CY" "${sp:k%4:1}" "$C0" "$CB" "$pg" "$C0"
+    r=$(( (r+1) % rows )); k=$((k+1)); sleep 0.07
+  done
+  if [ "$SIMPLE" -eq 1 ]; then printf '\r\e[K'; elif [ $drawn -eq 1 ]; then printf '\e[%dA\e[J' "$H"; fi
+  stty echo 2>/dev/null
+}
+
+scan_page() { # dev file pagenum
+  do_scan "$1" "$2" &
+  local pid=$!
+  scan_anim "$pid" "$3"
+  wait "$pid"
+}
+
+first_page() { # file [pagenum] - tries every device until one works
+  local i pg="${2:-1}"
+  for i in "${!DEVS[@]}"; do
+    if scan_page "${DEVS[i]}" "$1" "$pg"; then
+      DEV=${DEVS[i]}; [ "$PIN" = 1 ] || PREFDEV=$DEV; save_conf; load_devs; return 0
+    fi
+    LASTERR=$(last_err); rm -f "$1"
+    if [ $((i+1)) -lt ${#DEVS[@]} ]; then
+      printf '  %s%s %s failed%s %s(%s), trying the next one%s\n' "$CR" "$NO" "${DESC[i]}" "$C0" "$CD" "$LASTERR" "$C0"
+    fi
+  done
+  return 1
+}
+
+build_pdf() { # out images...
+  local out="$1" im; shift
+  if command -v img2pdf >/dev/null 2>&1; then img2pdf "$@" -o "$out" 2>/dev/null && return 0; fi
+  if python3 -c 'import PIL' 2>/dev/null; then
+    RES="$RES" python3 - "$out" "$@" <<'PY' 2>/dev/null && return 0
+import sys, os
+from PIL import Image
+out = sys.argv[1]
+ims = [Image.open(p).convert("RGB") for p in sys.argv[2:]]
+ims[0].save(out, "PDF", save_all=True, append_images=ims[1:], resolution=float(os.environ.get("RES", "150")))
+PY
+  fi
+  for im in magick convert; do
+    command -v $im >/dev/null 2>&1 && $im "$@" "$out" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+make_out() {
+  local imgs=("$SD"/p*."$EXT") i=0 pg
+  if [ "$FMT" = pdf ]; then build_pdf "$PDF" "${imgs[@]}"
+  elif [ "$n" -eq 1 ]; then cp "${imgs[0]}" "$PDF"
+  else
+    mkdir -p "$PDF" || return 1
+    for pg in "${imgs[@]}"; do i=$((i+1)); cp "$pg" "$(printf '%s/page_%03d.%s' "$PDF" "$i" "$EXT")" || return 1; done
+  fi
+}
+
+# ---------- next-page prompt, auto mode ----------
+auto_warning() {
+  local d=${AUTO_DELAY:-5}
+  printf '  %s!! RISK:%s auto mode does not wait for you. if you are slower than %ss per page,\n' "$CR" "$C0" "$d"
+  printf '     it scans an empty or half-placed page, and there is no undo for that page.\n'
+  printf '     any key during the countdown stops auto mode.\n'
+}
+auto_countdown() {
+  local k a
+  drain
+  for ((k=${AUTO_DELAY:-5};k>=1;k--)); do
+    printf '\r  %sauto-scan: scanning in %ds ... place the page. any key = stop auto%s\e[K' "$CY" "$k" "$C0"
+    if read -rsn1 -t 1 a; then
+      AUTO=0; printf '\r\e[K  %sauto mode off.%s\n' "$CD" "$C0"; return 1
+    fi
+  done
+  printf '\r\e[K'
+  return 0
+}
+next_page_prompt() {
+  local n=$1 a rc idle=0 pool=()
+  local t1=("page $n done. look at you, being productive." "ooh, a multi-pager. fancy." "still going? I was just getting comfortable.")
+  local t2=("page $n. I've aged a little since page 1." "are you scanning a document or the entire archive?" "at this rate the glass and I are getting engaged." "my lamp is getting tired. just saying." "fun fact: staples are not scanner-friendly. you're welcome.")
+  local t3=("PAGE $n. we are in this for the long haul, apparently." "I've started naming the dust specks on the glass. this one's Kevin." "you know there's a feeder-type scanner for this, right? no? okay." "somewhere a tree is feeling very seen." "I'm not saying you're slow, I'm saying my patience has a 150 dpi limit." "take your time. I'm only a scanner. I have no hobbies.")
+  local idl=("...hello? still there?" "I can hear the paper shuffling. or is it you napping?" "taking forever, boss. just noting it." "the glass is cooling down. so is my enthusiasm." "I could've scanned a novel by now." "Y or N. two letters. you got this." "I'm timing this. it's not looking great for you.")
+
+  if [ "$AUTO" = 1 ]; then
+    auto_countdown && return 0
+  fi
+  if sassy && [ "$n" -ge 2 ]; then
+    if [ "$n" -le 3 ]; then pool=("${t1[@]}"); elif [ "$n" -le 6 ]; then pool=("${t2[@]}"); else pool=("${t3[@]}"); fi
+    say_m "${pool[RANDOM % ${#pool[@]}]}"
+  fi
+  if [ "$n" -ge 3 ] && [ "$AUTOUSED" != 1 ]; then
+    printf '  %stip: Enter instead of Y = yes to all. auto-scans each page 5s apart. risky if you are slow: no undo for a bad page.%s\n' "$CD" "$C0"
+  fi
+  while true; do
+    drain
+    printf '  %sHave you placed the next page? Y/N:%s ' "$CY" "$C0"
+    read -rn1 -t 15 a; rc=$?
+    if [ $rc -gt 128 ]; then
+      echo; idle=$((idle+1))
+      if sassy; then
+        say_m "${idl[RANDOM % ${#idl[@]}]}"
+        [ $idle -ge 4 ] && say_m "I'm starting to charge rent on this USB port."
+      fi
+      continue
+    elif [ $rc -ne 0 ]; then exit 0; fi
+    echo
+    case "$a" in
+      y|Y) return 0 ;;
+      n|N) return 1 ;;
+      "") AUTO=1; AUTOUSED=1; printf '  %sauto mode ON: yes to all pages.%s\n' "$CG" "$C0"; auto_warning
+          auto_countdown && return 0 ;;
+      *) echo "  Y, N, or Enter." ;;
+    esac
+  done
+}
+
+# ---------- output animations ----------
+bind_draw() { # percent tick
+  local p=$1 t=$2 fl pos pg=${n:-1} stack line
+  fl=$(( p*BW/100 ))
+  if [ "$COLS" -ge 58 ]; then
+    [ "$pg" -gt 6 ] && pg=6
+    stack=$(rep "$PGL" "$pg"); pos=$(( t % 10 ))
+    line="  ${CM}binding${C0} ${CC}${stack}${C0} ${CD}$(rep "$DOT" "$pos")${CG}${ARW}${CD}$(rep "$DOT" $((9-pos)))${C0} ${CB}[${FMT^^}]${C0} ${CG}$(rep "$BLK" "$fl")${CD}$(rep "$LT" $((BW-fl)))${C0} $(printf '%3d%%' "$p")"
+  else
+    line="  ${CM}binding${C0} ${CG}$(rep "$BLK" "$fl")${CD}$(rep "$LT" $((BW-fl)))${C0} $(printf '%3d%%' "$p")"
+  fi
+  printf '\r%s\e[K' "$line"
+}
+bind_anim() {
+  local pid=$1 i=0 p=0 BW=14
+  [ "$COLS" -lt 58 ] && BW=20
+  while kill -0 "$pid" 2>/dev/null; do
+    p=$(( 95 - 9500/(100+i*6) ))
+    bind_draw "$p" "$i"
+    i=$((i+1)); sleep 0.05
+  done
+  while [ "$p" -lt 100 ]; do
+    p=$((p+7)); [ "$p" -gt 100 ] && p=100
+    bind_draw "$p" "$i"; i=$((i+1)); sleep 0.02
+  done
+  printf '\r  %s%s packed %s page(s)%s\e[K\n' "$CG" "$OK" "${n:-?}" "$C0"
+}
+confetti() {
+  local f i out cols=(31 32 33 34 35 36) ch=('*' '+' '.' 'o' '~')
+  for ((f=0;f<10;f++)); do
+    out=""
+    for ((i=0;i<46;i++)); do
+      if (( RANDOM % 5 == 0 )); then out+=$'\e['"${cols[RANDOM%6]}"'m'"${ch[RANDOM%5]}"; else out+=' '; fi
+    done
+    printf '\r  %s\e[0m\e[K' "$out"; sleep 0.07
+  done
+  printf '\r\e[K'
+}
+show_saved() { # path pages
+  local path=$1 pg=$2 sz lbl="${FMT^^}" i f
+  local rows=(
+".----------------."
+"| ${lbl}   ___      |"
+"|      |   |     |"
+"| ===  |___|     |"
+"| ============   |"
+"| ========       |"
+"| ==========     |"
+"'----------------'"
+)
+  LAST_SAVED=$path
+  sz=$(du -sh "$path" 2>/dev/null | cut -f1)
+  echo
+  if [ "$SIMPLE" -eq 0 ] && [ "$COLS" -ge 30 ]; then
+    for i in "${!rows[@]}"; do printf '     %s%s%s\n' "$CG" "${rows[i]}" "$C0"; sleep 0.05; done
+    for f in 1 2 3 4; do
+      printf '\r     %s\e[7m  S A V E D  \e[0m\e[K' "$CB$CG"; sleep 0.09
+      printf '\r     %s  S A V E D  %s\e[K' "$CD" "$C0"; sleep 0.09
+    done
+    printf '\r     %s\e[7m  S A V E D  \e[0m\e[K\n\n' "$CB$CG"
+    [ "$COLS" -ge 50 ] && confetti
+  fi
+  typewrite "  >> $path"
+  printf '  %s%s page(s) | %s | %s | %s dpi%s\n' "$CD" "$pg" "${sz:-?}" "${FMT^^}" "$RES" "$C0"
+}
+again_menu() { # 0 = go again, 1 = close
+  local a rc idle=0 w=44
+  local idl=("still here. just me and the lamp." "no rush. I'm literally bolted to a desk." "A to go again, C to close. two buttons. I believe in you." "take your time. I'll be over here, glowing." "plot twist: the scanner is waiting on YOU now.")
+  echo
+  if [ "$COMPACT" -eq 1 ]; then
+    printf '  %s[A]%s again  %s[O]%s open  %s[C]%s close\n' "$CG" "$C0" "$CY" "$C0" "$CR" "$C0"
+  else
+    printf '  %s%s%s%s%s\n' "$CC" "$TL" "$(rep "$HL" $w)" "$TR" "$C0"
+    printf '  %s%s%s  %s[A]%s scan again  %s[O]%s open file  %s[C]%s close  %s%s%s\n' "$CC" "$VL" "$C0" "$CG" "$C0" "$CY" "$C0" "$CR" "$C0" "$CC" "$VL" "$C0"
+    printf '  %s%s%s%s%s\n' "$CC" "$BL" "$(rep "$HL" $w)" "$BR" "$C0"
+  fi
+  tput cnorm 2>/dev/null
+  while true; do
+    drain
+    printf '\r  %s>%s ' "$CG" "$C0"
+    read -rsn1 -t 20 a; rc=$?
+    if [ $rc -gt 128 ]; then
+      if sassy; then echo; say_m "${idl[idle % ${#idl[@]}]}"; fi
+      idle=$((idle+1)); continue
+    elif [ $rc -ne 0 ]; then exit 0; fi
+    case "$a" in
+      a|A) tput civis 2>/dev/null; printf '\r\e[K'; return 0 ;;
+      c|C|q|Q) tput civis 2>/dev/null; printf '\r\e[K'; return 1 ;;
+      o|O) if [ -n "$LAST_SAVED" ] && [ -e "$LAST_SAVED" ] && command -v xdg-open >/dev/null 2>&1; then
+             xdg-open "$LAST_SAVED" >/dev/null 2>&1 &
+             printf '\r\e[K  %sopening it ...%s\n' "$CD" "$C0"
+           else
+             printf '\r\e[K  %snothing to open.%s\n' "$CD" "$C0"
+           fi ;;
+    esac
+  done
+}
+farewell() {
+  local t="lamp off. see you, boss." cols=(31 33 32 36 34 35) i
+  printf '\n  '
+  for ((i=0;i<${#t};i++)); do printf '\e[1;%sm%s\e[0m' "${cols[i%6]}" "${t:i:1}"; sleep 0.02; done
+  printf '\n  %slonecrafts :: unique is the motto%s\n\n' "$CD" "$C0"
+  sleep 0.3
+}
+
+# ---------- one scanning session ----------
+run_session() {
+  local n=0 f name base PDF SD
+  AUTO=0; AUTOUSED=0; SFMT=png; EXT=png; [ "$FMT" = jpg ] && { SFMT=jpeg; EXT=jpg; }
+  SD=$(mktemp -d "$TMP/s.XXXXXX") || return 1
+  DEV=""
+  printf '  %slocked on:%s %s  %s(%s dpi, %s)%s\n\n' "$CD" "$C0" "${DESC[0]}" "$CD" "$RES" "${FMT^^}" "$C0"
+
+  while true; do
+    f=$(printf '%s/p%03d.%s' "$SD" $((n+1)) "$EXT")
+    if [ $n -eq 0 ]; then
+      if ! first_page "$f" 1; then
+        printf '\n  %s%s no scanner answered.%s\n' "$CR" "$NO" "$C0"
+        [ -n "$LASTERR" ] && printf '  %slast error: %s  (log: ~/.cache/scan2pdf.log)%s\n' "$CD" "$LASTERR" "$C0"
+        printf '  check: lid closed? scanner awake? cable / Wi-Fi ok?\n'
+        rm -rf "$SD"; return 1
+      fi
+    else
+      if ! first_page "$f" $((n+1)); then
+        printf '  %s%s page %d failed%s %s(%s)  log: ~/.cache/scan2pdf.log%s\n' "$CR" "$NO" $((n+1)) "$C0" "$CD" "$LASTERR" "$C0"
+        rm -f "$f"
+        ask_yn "Retry this page?" && continue
+        break
+      fi
+    fi
+    n=$((n+1))
+    printf '  %s%s page %d captured%s\n\n' "$CG" "$OK" "$n" "$C0"
+    next_page_prompt "$n" || break
+  done
+
+  [ $n -eq 0 ] && { rm -rf "$SD"; return 1; }
+
+  tput cnorm 2>/dev/null; drain
+  printf '\n  %sName the document (Enter = auto-name):%s ' "$CY" "$C0"
+  read -r name || name=""
+  tput civis 2>/dev/null
+  name=$(printf '%s' "$name" | tr '/\\' '__' | tr -d '\000-\037:*?"<>|' | sed 's/^[ .]*//; s/ *$//; s/\.\(pdf\|png\|jpe\?g\)$//I' | cut -c1-80)
+  base=${name:-scan_$(date +%Y%m%d_%H%M%S)}
+
+  mkdir -p "$OUT" 2>/dev/null
+  if [ ! -w "$OUT" ]; then printf '  %scannot write to %s, using your home folder%s\n' "$CY" "$OUT" "$C0"; OUT=$HOME; fi
+  if [ "$FMT" = pdf ]; then PDF=$(uniq_path "$OUT/$base" .pdf)
+  elif [ $n -eq 1 ]; then PDF=$(uniq_path "$OUT/$base" ".$EXT")
+  else PDF=$(uniq_path "$OUT/$base" ""); fi
+
+  echo
+  ( make_out; echo $? > "$SD/rc"; sleep 0.6 ) 2>/dev/null &
+  bind_anim $!
+  wait
+
+  if [ "$(cat "$SD/rc" 2>/dev/null)" != 0 ] || [ ! -e "$PDF" ]; then
+    rm -rf "$PDF"
+    printf '  %s%s could not build the output (PDF needs img2pdf, python3-pil or imagemagick).%s\n' "$CR" "$NO" "$C0"
+    PDF=$(uniq_path "$OUT/${base}_images" ""); mkdir -p "$PDF"; cp "$SD"/p*."$EXT" "$PDF"/
+    printf '  saved the raw page images instead. fix: install img2pdf\n'
+  fi
+
+  show_saved "$PDF" "$n"
+  command -v xdg-open >/dev/null 2>&1 && xdg-open "$OUT" >/dev/null 2>&1 &
+  rm -rf "$SD"
+  echo
+  return 0
+}
+
+# ---------- main ----------
+detect_start
+banner
+lobby
+while true; do
+  ensure_devs && run_session
+  again_menu || { farewell; exit 0; }
+  banner
+done
